@@ -117,37 +117,37 @@ struct OverlayPositionThumbnail: View {
     }
 }
 
-struct SettingsView: View {
-    private enum Page: CaseIterable {
-        case general, translation, overlay, history, privacy, about
+enum SettingsPage: CaseIterable, Hashable {
+    case general, translation, overlay, history, privacy, about
 
-        var systemImage: String {
-            switch self {
-            case .general: return "gearshape"
-            case .translation: return "character.bubble"
-            case .overlay: return "rectangle.on.rectangle"
-            case .history: return "clock"
-            case .privacy: return "lock"
-            case .about: return "info.circle"
-            }
-        }
-
-        func title(_ lang: UILanguage) -> String {
-            switch self {
-            case .general: return L10n.tabGeneral(lang)
-            case .translation: return L10n.tabTranslation(lang)
-            case .overlay: return L10n.tabOverlay(lang)
-            case .history: return L10n.tabHistory(lang)
-            case .privacy: return L10n.tabPrivacy(lang)
-            case .about: return L10n.tabAbout(lang)
-            }
+    var systemImage: String {
+        switch self {
+        case .general: return "gearshape"
+        case .translation: return "character.bubble"
+        case .overlay: return "rectangle.on.rectangle"
+        case .history: return "clock"
+        case .privacy: return "lock"
+        case .about: return "info.circle"
         }
     }
 
+    func title(_ lang: UILanguage) -> String {
+        switch self {
+        case .general: return L10n.tabGeneral(lang)
+        case .translation: return L10n.tabTranslation(lang)
+        case .overlay: return L10n.tabOverlay(lang)
+        case .history: return L10n.tabHistory(lang)
+        case .privacy: return L10n.tabPrivacy(lang)
+        case .about: return L10n.tabAbout(lang)
+        }
+    }
+}
+
+struct SettingsView: View {
     @ObservedObject var state: AppState
     @ObservedObject private var settings: SettingsStore
     @ObservedObject private var history: TranslationHistoryController
-    @State private var selectedPage: Page = .general
+    @State private var selectedPage: SettingsPage
     @State private var draggedModelID: UUID?
     @State private var historyExportMessage: String?
     @State private var confirmDeleteHistory = false
@@ -157,6 +157,7 @@ struct SettingsView: View {
         self.state = state
         self._settings = ObservedObject(wrappedValue: state.settings)
         self._history = ObservedObject(wrappedValue: state.history)
+        self._selectedPage = State(initialValue: state.requestedSettingsPage)
     }
 
     private var lang: UILanguage { settings.uiLanguage }
@@ -170,11 +171,14 @@ struct SettingsView: View {
         .frame(minWidth: 760, idealWidth: 840, minHeight: 520, idealHeight: 700)
         .onAppear { state.updateSettingsWindowTitle() }
         .onChange(of: settings.uiLanguage) { _, _ in state.updateSettingsWindowTitle() }
+        .onChange(of: state.settingsNavigationGeneration) { _, _ in
+            selectedPage = state.requestedSettingsPage
+        }
     }
 
     private var tabBar: some View {
         HStack(spacing: 6) {
-            ForEach(Page.allCases, id: \.self) { page in
+            ForEach(SettingsPage.allCases, id: \.self) { page in
                 tabButton(page)
             }
         }
@@ -182,7 +186,7 @@ struct SettingsView: View {
         .padding(.vertical, 6)
     }
 
-    private func tabButton(_ page: Page) -> some View {
+    private func tabButton(_ page: SettingsPage) -> some View {
         let selected = selectedPage == page
         return Button {
             selectedPage = page
@@ -442,6 +446,18 @@ struct SettingsView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
             .padding(.leading, 184)
+        if let error = settings.apiKeyStorageError {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(L10n.apiKeyStorageFailed(lang))
+                    .foregroundStyle(.orange)
+                Text(error)
+                    .font(.caption)
+                    .textSelection(.enabled)
+                Button(L10n.retryAPIKeyStorage(lang)) { settings.retryAPIKeyStorage() }
+                    .controlSize(.small)
+            }
+            .padding(.leading, 184)
+        }
         if settings.llmModels.isEmpty {
             Text(L10n.noModels(lang))
                 .foregroundStyle(.secondary)
@@ -456,6 +472,7 @@ struct SettingsView: View {
                         model: model,
                         language: lang,
                         save: { settings.updateLLMModel($0) },
+                        clearAPIKey: { settings.clearAPIKey(forModelID: model.id) },
                         remove: { settings.removeLLMModel(id: model.id) })
                         .padding(10)
                         .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
@@ -957,14 +974,17 @@ private struct ModelOrderDropDelegate: DropDelegate {
 struct LLMModelEditor: View {
     @State private var draft: LLMModelConfiguration
     @State private var isExpanded = false
+    private let model: LLMModelConfiguration
     let language: UILanguage
     let save: (LLMModelConfiguration) -> Void
+    let clearAPIKey: () -> Bool
     let remove: () -> Void
 
     init(
         model: LLMModelConfiguration,
         language: UILanguage,
         save: @escaping (LLMModelConfiguration) -> Void,
+        clearAPIKey: @escaping () -> Bool,
         remove: @escaping () -> Void
     ) {
         var initialDraft = model
@@ -975,8 +995,10 @@ struct LLMModelEditor: View {
             initialDraft.systemPrompt = LLMTranslationPrompt.defaultSystemPrompt
         }
         _draft = State(initialValue: initialDraft)
+        self.model = model
         self.language = language
         self.save = save
+        self.clearAPIKey = clearAPIKey
         self.remove = remove
     }
 
@@ -1044,7 +1066,13 @@ struct LLMModelEditor: View {
                     TextField(L10n.urlPlaceholder(language), text: $draft.baseURL).textFieldStyle(.roundedBorder)
                 }
                 SettingsRow(label: L10n.apiKey(language)) {
-                    SecureField("", text: $draft.apiKey).textFieldStyle(.roundedBorder)
+                    HStack(spacing: 8) {
+                        SecureField("", text: $draft.apiKey).textFieldStyle(.roundedBorder)
+                        Button(L10n.clearAPIKey(language)) {
+                            if clearAPIKey() { draft.apiKey = "" }
+                        }
+                        .controlSize(.small)
+                    }
                 }
                 SettingsRow(label: L10n.modelID(language)) {
                     TextField(L10n.modelIDPlaceholder(language), text: $draft.model).textFieldStyle(.roundedBorder)
@@ -1085,6 +1113,9 @@ struct LLMModelEditor: View {
             }
         }
         .onChange(of: draft) { _, updated in save(updated) }
+        .onChange(of: model.apiKey) { _, key in
+            if draft.apiKey.isEmpty, !key.isEmpty { draft.apiKey = key }
+        }
     }
 
     private func thinkingName(_ mode: LLMThinkingMode) -> String {

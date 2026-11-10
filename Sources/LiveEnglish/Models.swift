@@ -328,10 +328,26 @@ public actor TranslationCoordinator {
     public func clearCache() { cache.removeAll(keepingCapacity: true) }
 
     public func translate(_ text: String) async -> String? {
-        await translate(text, from: sourceLanguage, to: targetLanguage)
+        do {
+            return try await translateReportingErrors(text, from: sourceLanguage, to: targetLanguage)
+        } catch {
+            return nil
+        }
     }
 
     public func translate(_ text: String, from source: Language, to target: Language) async -> String? {
+        do {
+            return try await translateReportingErrors(text, from: source, to: target)
+        } catch {
+            return nil
+        }
+    }
+
+    public func translateReportingErrors(_ text: String) async throws -> String? {
+        try await translateReportingErrors(text, from: sourceLanguage, to: targetLanguage)
+    }
+
+    public func translateReportingErrors(_ text: String, from source: Language, to target: Language) async throws -> String? {
         let key = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return nil }
         guard source != target else { return key }
@@ -347,9 +363,12 @@ public actor TranslationCoordinator {
             guard current == generation, !Task.isCancelled else { return nil }
             cache[cacheKey] = value
             return value
-        } catch {
-            DiagnosticLog.write("translation error type=\(String(reflecting: error))")
+        } catch is CancellationError {
             return nil
+        } catch {
+            guard current == generation, !Task.isCancelled else { return nil }
+            DiagnosticLog.write("translation error type=\(String(reflecting: type(of: error)))")
+            throw error
         }
     }
     public func cancel() {

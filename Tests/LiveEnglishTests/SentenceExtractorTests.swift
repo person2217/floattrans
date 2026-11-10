@@ -195,6 +195,20 @@ final class TranslationCoordinatorTests: XCTestCase {
         XCTAssertNil(result)
     }
 
+    func testReportingTranslationPreservesProviderErrorDetails() async {
+        let expected = LLMTranslationError.httpStatus(model: "DeepSeek", statusCode: 401, message: "Unauthorized")
+        let coordinator = TranslationCoordinator(engine: FailingEngine(error: expected))
+
+        do {
+            _ = try await coordinator.translateReportingErrors("你好")
+            XCTFail("Expected the provider error to be returned to the caller")
+        } catch let error as LLMTranslationError {
+            XCTAssertEqual(error, expected)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     func testDirectionChangesArePassedToEngine() async {
         let coordinator = TranslationCoordinator(engine: DirectionEchoEngine())
         await coordinator.setDirection(from: .english, to: .russian)
@@ -212,6 +226,14 @@ private struct DirectionEchoEngine: TranslationEngine {
 private struct MissingResourceEngine: TranslationEngine {
     func translate(_ text: String, from: Language, to: Language) async throws -> String {
         throw TranslationTestError.missingResources
+    }
+}
+
+private struct FailingEngine: TranslationEngine {
+    let error: LLMTranslationError
+
+    func translate(_ text: String, from: Language, to: Language) async throws -> String {
+        throw error
     }
 }
 

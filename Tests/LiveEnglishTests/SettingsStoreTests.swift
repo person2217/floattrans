@@ -433,6 +433,108 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(keychain.readIDs, [modelID])
     }
 
+    func testKeychainReadFailureDoesNotDeleteKeyAndCanBeRetried() throws {
+        let defaults = UserDefaults.standard
+        let saved = snapshot(defaults)
+        defer { restore(defaults, saved) }
+
+        for key in keys { defaults.removeObject(forKey: key) }
+        defaults.set(false, forKey: "launchAtLogin")
+        defaults.set(TranslationBackend.languageModel.rawValue, forKey: "translationBackend")
+
+        let modelID = UUID()
+        let model = LLMModelConfiguration(
+            id: modelID, name: "DeepSeek", baseURL: "https://api.deepseek.com/v1", model: "deepseek-chat")
+        defaults.set(try JSONEncoder().encode([model]), forKey: "llmModels")
+
+        let keychain = InMemoryAPIKeyStore()
+        try keychain.setAPIKey("stored-secret", forModelID: modelID)
+        keychain.failNextRead()
+        let store = SettingsStore(keychain: keychain)
+
+        XCTAssertEqual(store.llmModels.first?.apiKey, "")
+        XCTAssertTrue(store.apiKeyStorageError?.contains("read failed") == true)
+
+        var editedModel = try XCTUnwrap(store.llmModels.first)
+        editedModel.name = "Renamed model"
+        store.updateLLMModel(editedModel)
+
+        XCTAssertEqual(keychain.storedKey(for: modelID), "stored-secret")
+        XCTAssertTrue(keychain.deleteIDs.isEmpty)
+
+        store.retryAPIKeyStorage()
+
+        XCTAssertEqual(store.llmModels.first?.apiKey, "stored-secret")
+        XCTAssertNil(store.apiKeyStorageError)
+    }
+
+    func testKeychainWriteFailureIsVisibleAndCanBeRetried() throws {
+        let defaults = UserDefaults.standard
+        let saved = snapshot(defaults)
+        defer { restore(defaults, saved) }
+
+        for key in keys { defaults.removeObject(forKey: key) }
+        defaults.set(false, forKey: "launchAtLogin")
+        defaults.set(TranslationBackend.languageModel.rawValue, forKey: "translationBackend")
+
+        let modelID = UUID()
+        let model = LLMModelConfiguration(
+            id: modelID, name: "DeepSeek", baseURL: "https://api.deepseek.com/v1", model: "deepseek-chat")
+        defaults.set(try JSONEncoder().encode([model]), forKey: "llmModels")
+
+        let keychain = InMemoryAPIKeyStore()
+        try keychain.setAPIKey("old-secret", forModelID: modelID)
+        let store = SettingsStore(keychain: keychain)
+        keychain.failNextWrite()
+        var editedModel = try XCTUnwrap(store.llmModels.first)
+        editedModel.apiKey = "new-secret"
+        store.updateLLMModel(editedModel)
+
+        XCTAssertEqual(store.llmModels.first?.apiKey, "new-secret")
+        XCTAssertTrue(store.apiKeyStorageError?.contains("write failed") == true)
+        XCTAssertEqual(keychain.storedKey(for: modelID), "old-secret")
+        let fallbackData = try XCTUnwrap(defaults.data(forKey: "llmModels"))
+        let fallbackModels = try JSONDecoder().decode([LLMModelConfiguration].self, from: fallbackData)
+        XCTAssertEqual(fallbackModels.first?.apiKey, "new-secret")
+
+        store.retryAPIKeyStorage()
+
+        XCTAssertEqual(keychain.storedKey(for: modelID), "new-secret")
+        XCTAssertNil(store.apiKeyStorageError)
+        let keychainBackedData = try XCTUnwrap(defaults.data(forKey: "llmModels"))
+        let keychainBackedModels = try JSONDecoder().decode([LLMModelConfiguration].self, from: keychainBackedData)
+        XCTAssertEqual(keychainBackedModels.first?.apiKey, "")
+    }
+
+    func testAPIKeyIsOnlyDeletedByExplicitClearAction() throws {
+        let defaults = UserDefaults.standard
+        let saved = snapshot(defaults)
+        defer { restore(defaults, saved) }
+
+        for key in keys { defaults.removeObject(forKey: key) }
+        defaults.set(false, forKey: "launchAtLogin")
+        defaults.set(TranslationBackend.languageModel.rawValue, forKey: "translationBackend")
+
+        let modelID = UUID()
+        let model = LLMModelConfiguration(
+            id: modelID, name: "DeepSeek", baseURL: "https://api.deepseek.com/v1", model: "deepseek-chat")
+        defaults.set(try JSONEncoder().encode([model]), forKey: "llmModels")
+
+        let keychain = InMemoryAPIKeyStore()
+        try keychain.setAPIKey("stored-secret", forModelID: modelID)
+        let store = SettingsStore(keychain: keychain)
+        var modelWithoutKey = try XCTUnwrap(store.llmModels.first)
+        modelWithoutKey.apiKey = ""
+        store.updateLLMModel(modelWithoutKey)
+
+        XCTAssertEqual(keychain.storedKey(for: modelID), "stored-secret")
+        XCTAssertTrue(keychain.deleteIDs.isEmpty)
+
+        XCTAssertTrue(store.clearAPIKey(forModelID: modelID))
+        XCTAssertNil(keychain.storedKey(for: modelID))
+        XCTAssertEqual(keychain.deleteIDs, [modelID])
+    }
+
     private func snapshot(_ defaults: UserDefaults) -> [String: Any?] {
         Dictionary(uniqueKeysWithValues: keys.map { ($0, defaults.object(forKey: $0)) })
     }
@@ -450,10 +552,19 @@ final class SettingsStoreTests: XCTestCase {
 
 private final class InMemoryAPIKeyStore: APIKeyStore, @unchecked Sendable {
     private var keys: [UUID: String] = [:]
+    private var readFailuresRemaining = 0
+    private var writeFailuresRemaining = 0
     private(set) var readIDs: [UUID] = []
     private(set) var deleteIDs: [UUID] = []
 
+    func failNextRead() { readFailuresRemaining += 1 }
+    func failNextWrite() { writeFailuresRemaining += 1 }
+
     func setAPIKey(_ value: String?, forModelID id: UUID) throws {
+        if writeFailuresRemaining > 0 {
+            writeFailuresRemaining -= 1
+            throw InMemoryAPIKeyStoreError.write
+        }
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if trimmed.isEmpty {
             keys.removeValue(forKey: id)
@@ -464,6 +575,10 @@ private final class InMemoryAPIKeyStore: APIKeyStore, @unchecked Sendable {
 
     func apiKey(forModelID id: UUID) throws -> String? {
         readIDs.append(id)
+        if readFailuresRemaining > 0 {
+            readFailuresRemaining -= 1
+            throw InMemoryAPIKeyStoreError.read
+        }
         return keys[id]
     }
 
@@ -474,6 +589,17 @@ private final class InMemoryAPIKeyStore: APIKeyStore, @unchecked Sendable {
 
     func storedKey(for id: UUID) -> String? {
         keys[id]
+    }
+}
+
+private enum InMemoryAPIKeyStoreError: LocalizedError {
+    case read, write
+
+    var errorDescription: String? {
+        switch self {
+        case .read: return "test keychain read failed"
+        case .write: return "test keychain write failed"
+        }
     }
 }
 

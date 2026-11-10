@@ -274,6 +274,7 @@ struct ReplaceShortcut: Equatable, Sendable {
             onTranslationSettingsChanged?()
         }
     }
+    @Published private(set) var apiKeyStorageError: String? = nil
     @Published var llmFallbackTimeout: Double {
         didSet {
             let normalized = Self.clampLLMTimeout(llmFallbackTimeout)
@@ -365,9 +366,11 @@ struct ReplaceShortcut: Equatable, Sendable {
     var onHistoryRetentionChanged: (() -> Void)?
     private let defaults = UserDefaults.standard
     private let keychain: any APIKeyStore
-    /// Keys stay in Keychain until language-model translation needs them, so
-    /// a local-translation launch does not prompt for Keychain access.
+    /// Keys are restored from Keychain only when LLM translation is active;
+    /// a local-only launch does not prompt for Keychain access.
     private var apiKeysLoaded = false
+    private var apiKeyReadError: String?
+    private var apiKeyWriteError: String?
 
     init(keychain: any APIKeyStore = KeychainStore()) {
         self.keychain = keychain
@@ -494,6 +497,30 @@ struct ReplaceShortcut: Equatable, Sendable {
         llmModels[index] = updated
     }
 
+    @discardableResult
+    func clearAPIKey(forModelID id: UUID) -> Bool {
+        do {
+            try keychain.deleteAPIKey(forModelID: id)
+        } catch {
+            apiKeyWriteError = error.localizedDescription
+            refreshAPIKeyStorageError()
+            return false
+        }
+        apiKeyWriteError = nil
+        refreshAPIKeyStorageError()
+        guard let index = llmModels.firstIndex(where: { $0.id == id }) else { return true }
+        var updated = llmModels
+        updated[index].apiKey = ""
+        llmModels = updated
+        return true
+    }
+
+    func retryAPIKeyStorage() {
+        _ = persistLLMModels()
+        apiKeysLoaded = false
+        ensureAPIKeysAvailable()
+    }
+
     func addLLMModel(_ model: LLMModelConfiguration) {
         var model = model
         model.timeoutSeconds = 0
@@ -502,7 +529,12 @@ struct ReplaceShortcut: Equatable, Sendable {
 
     func removeLLMModel(id: UUID) {
         llmModels.removeAll { $0.id == id }
-        try? keychain.deleteAPIKey(forModelID: id)
+        do {
+            try keychain.deleteAPIKey(forModelID: id)
+        } catch {
+            apiKeyWriteError = error.localizedDescription
+            refreshAPIKeyStorageError()
+        }
     }
 
     func moveLLMModels(from offsets: IndexSet, to destination: Int) {
@@ -565,54 +597,70 @@ struct ReplaceShortcut: Equatable, Sendable {
         return (try? JSONDecoder().decode([LLMModelConfiguration].self, from: data)) ?? []
     }
 
-    private func persistLLMModels() {
+    @discardableResult
+    private func persistLLMModels() -> Bool {
         var publicModels = llmModels
-        if apiKeysLoaded {
-            for index in publicModels.indices {
-                let model = publicModels[index]
-                if model.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    try? keychain.deleteAPIKey(forModelID: model.id)
-                } else {
-                    try? keychain.setAPIKey(model.apiKey, forModelID: model.id)
-                }
-                publicModels[index].apiKey = ""
-                publicModels[index].timeoutSeconds = 0
-            }
-        } else {
-            for index in publicModels.indices {
-                publicModels[index].apiKey = ""
-                publicModels[index].timeoutSeconds = 0
+        var failedWrites: [String] = []
+        var storedKeyIDs = Set<UUID>()
+        for model in llmModels where !model.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            do {
+                try keychain.setAPIKey(model.apiKey, forModelID: model.id)
+                storedKeyIDs.insert(model.id)
+            } catch {
+                failedWrites.append("\(model.name): \(error.localizedDescription)")
             }
         }
-        guard let data = try? JSONEncoder().encode(publicModels) else { return }
+        apiKeyWriteError = failedWrites.isEmpty ? nil : failedWrites.joined(separator: "\n")
+        refreshAPIKeyStorageError()
+        for index in publicModels.indices {
+            if storedKeyIDs.contains(publicModels[index].id) {
+                publicModels[index].apiKey = ""
+            }
+            publicModels[index].timeoutSeconds = 0
+        }
+        guard let data = try? JSONEncoder().encode(publicModels) else { return false }
         defaults.set(data, forKey: "llmModels")
+        return failedWrites.isEmpty
     }
 
     private func ensureAPIKeysAvailable() {
         guard !apiKeysLoaded else { return }
-        apiKeysLoaded = true
-        restoreAPIKeysFromKeychain()
-        migrateLegacyAPIKeysToKeychain()
-    }
-
-    private func restoreAPIKeysFromKeychain() {
         var models = llmModels
         var changed = false
-        for index in models.indices {
-            if let value = try? keychain.apiKey(forModelID: models[index].id), !value.isEmpty {
-                models[index].apiKey = value
-                changed = true
+        var readFailure: String?
+        for index in models.indices where models[index].apiKey.isEmpty {
+            do {
+                if let value = try keychain.apiKey(forModelID: models[index].id), !value.isEmpty {
+                    models[index].apiKey = value
+                    changed = true
+                }
+            } catch {
+                readFailure = error.localizedDescription
             }
         }
+        apiKeyReadError = readFailure
+        apiKeysLoaded = readFailure == nil
+        refreshAPIKeyStorageError()
         if changed { llmModels = models }
+        guard apiKeysLoaded else { return }
+        migrateLegacyAPIKeysToKeychain()
     }
 
     private func migrateLegacyAPIKeysToKeychain() {
         // Models written by earlier preview builds may contain a plaintext
         // key in the preferences blob. Import it once and immediately rewrite
-        // the public snapshot with an empty key.
-        guard llmModels.contains(where: { !$0.apiKey.isEmpty }) else { return }
-        persistLLMModels()
+        // successfully imported keys as Keychain-backed entries.
+        guard llmModels.contains(where: { !$0.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            return
+        }
+        _ = persistLLMModels()
+    }
+
+    private func refreshAPIKeyStorageError() {
+        apiKeyStorageError = [apiKeyReadError, apiKeyWriteError]
+            .compactMap { $0 }
+            .joined(separator: "\n")
+        if apiKeyStorageError?.isEmpty == true { apiKeyStorageError = nil }
     }
 
     private static func clampLLMTimeout(_ value: Double) -> Double {

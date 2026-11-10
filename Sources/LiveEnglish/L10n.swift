@@ -125,6 +125,18 @@ enum L10n {
     }
     static func endpointURL(_ lang: UILanguage) -> String { "API URL" }
     static func apiKey(_ lang: UILanguage) -> String { lang == .chinese ? "API 密钥" : "API Key" }
+    static func clearAPIKey(_ lang: UILanguage) -> String { lang == .chinese ? "清除密钥" : "Clear Key" }
+    static func retryAPIKeyStorage(_ lang: UILanguage) -> String { lang == .chinese ? "重试密钥存储" : "Retry Key Storage" }
+    static func apiKeyStorageFailed(_ lang: UILanguage) -> String {
+        lang == .chinese ? "API 密钥无法安全保存或读取：" : "Could not securely save or read the API key:"
+    }
+    static func translationFailureTitle(_ lang: UILanguage) -> String {
+        lang == .chinese ? "大语言模型翻译失败" : "Language Model Translation Failed"
+    }
+    static func openModelSettings(_ lang: UILanguage) -> String {
+        lang == .chinese ? "打开模型设置" : "Open Model Settings"
+    }
+    static func dismissError(_ lang: UILanguage) -> String { lang == .chinese ? "关闭" : "OK" }
     static func modelID(_ lang: UILanguage) -> String { lang == .chinese ? "模型名称" : "Model ID" }
     static func prompt(_ lang: UILanguage) -> String { lang == .chinese ? "提示词" : "Prompt" }
     static func promptHint(_ lang: UILanguage) -> String {
@@ -144,7 +156,9 @@ enum L10n {
         lang == .chinese ? "超过 \(value) 秒切换" : "Switch after \(value) sec"
     }
     static func apiKeyKeychainHint(_ lang: UILanguage) -> String {
-        lang == .chinese ? "API 密钥仅保存于此 Mac 的钥匙串。" : "API keys are stored only in this Mac's Keychain."
+        lang == .chinese
+            ? "密钥优先保存在此 Mac 的钥匙串；若钥匙串不可用，会暂存于本机应用设置（不受钥匙串保护）。"
+            : "Keys are stored in this Mac's Keychain when available; otherwise they are kept in local app settings without Keychain protection."
     }
     static func modelPlaceholder(_ lang: UILanguage) -> String { lang == .chinese ? "例如：DeepSeek 主模型" : "For example: Primary DeepSeek" }
     static func urlPlaceholder(_ lang: UILanguage) -> String { "https://api.example.com/v1" }

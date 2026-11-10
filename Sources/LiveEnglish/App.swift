@@ -59,6 +59,8 @@ struct MenuBarMenu: View {
     @Published var translation = ""
     @Published var permissionGranted: Bool
     @Published var showWelcome: Bool
+    @Published var requestedSettingsPage: SettingsPage = .general
+    @Published private(set) var settingsNavigationGeneration = 0
     var settings: SettingsStore
     let permission = AccessibilityPermissionManager()
     let monitor = AccessibilityMonitor()
@@ -259,7 +261,9 @@ struct MenuBarMenu: View {
         welcomeWindow = nil
         syncChromePresence()
     }
-    func presentSettings() {
+    func presentSettings(page: SettingsPage = .general) {
+        requestedSettingsPage = page
+        settingsNavigationGeneration += 1
         if let settingsWindow {
             updateSettingsWindowTitle()
             AppPresence.reveal(settingsWindow)
@@ -341,27 +345,128 @@ struct MenuBarMenu: View {
             await settingsTask?.value
             guard !Task.isCancelled else { return }
             guard await MainActor.run(body: { self?.translationSettingsGeneration == generation }) else { return }
-            guard let result = await coordinator.translate(text) else {
+            do {
+                guard let result = try await coordinator.translateReportingErrors(text) else { return }
                 await MainActor.run {
-                    DiagnosticLog.write("translation returned no result")
-                    self?.logger.info("translation returned no result")
+                    self?.acceptTranslationResult(
+                        result,
+                        sourceText: text,
+                        sourceLanguage: sourceLanguage,
+                        targetLanguage: targetLanguage,
+                        key: sentenceKey,
+                        session: session,
+                        screen: screen,
+                        event: event,
+                        revision: revision)
                 }
-                return
-            }
-            await MainActor.run {
-                self?.acceptTranslationResult(
-                    result,
-                    sourceText: text,
-                    sourceLanguage: sourceLanguage,
-                    targetLanguage: targetLanguage,
-                    key: sentenceKey,
-                    session: session,
-                    screen: screen,
-                    event: event,
-                    revision: revision)
+            } catch {
+                await MainActor.run {
+                    guard let self,
+                        self.translationSettingsGeneration == generation,
+                        self.currentSession == session,
+                        self.currentInputRevision == revision,
+                        self.enabled
+                    else { return }
+                    DiagnosticLog.write("translation failed backend=\(self.settings.translationBackend.rawValue)")
+                    if self.settings.translationBackend == .languageModel {
+                        self.presentLanguageModelFailure(error)
+                    }
+                }
             }
         }
     }
+
+    private func presentLanguageModelFailure(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = L10n.translationFailureTitle(settings.uiLanguage)
+        alert.informativeText = languageModelFailureDetails(error)
+        alert.addButton(withTitle: L10n.openModelSettings(settings.uiLanguage))
+        alert.addButton(withTitle: L10n.dismissError(settings.uiLanguage))
+        if alert.runModal() == .alertFirstButtonReturn {
+            presentSettings(page: .translation)
+        }
+    }
+
+    private func languageModelFailureDetails(_ error: Error) -> String {
+        let lang = settings.uiLanguage
+        let details: String
+        if let error = error as? LLMTranslationError {
+            switch error {
+            case .emptyText:
+                details = lang == .chinese ? "没有可翻译的文本。" : "There is no text to translate."
+            case .noEnabledModels:
+                details = lang == .chinese
+                    ? "没有启用的大语言模型。请打开模型设置并启用一个模型。"
+                    : "No language model is enabled. Open model settings and enable one."
+            case let .invalidEndpoint(model, _):
+                details = lang == .chinese
+                    ? "\(model)：API 地址格式无效，请检查地址和 API 协议。"
+                    : "\(model): The API URL is invalid. Check the URL and API protocol."
+            case let .timeout(model, seconds):
+                details = lang == .chinese
+                    ? "\(model)：等待 \(seconds) 秒后仍无响应。"
+                    : "\(model): No response after \(seconds) seconds."
+            case let .httpStatus(model, status, message):
+                details = formattedHTTPFailure(model: model, status: status, message: message, language: lang)
+            case let .invalidResponse(model, message):
+                details = "\(model)：\(message)"
+            case let .allModelsFailed(failures):
+                details = failures.map { failure in
+                    if let status = Self.httpStatus(in: failure.message) {
+                        return formattedHTTPFailure(
+                            model: failure.modelName, status: status, message: failure.message, language: lang)
+                    }
+                    return "\(failure.modelName)：\(failure.message)"
+                }.joined(separator: "\n\n")
+            }
+        } else {
+            details = error.localizedDescription
+        }
+
+        var safeDetails = details
+        for model in settings.llmModels {
+            for protectedValue in [model.apiKey, model.baseURL] where !protectedValue.isEmpty {
+                safeDetails = safeDetails.replacingOccurrences(of: protectedValue, with: "[隐藏]")
+            }
+        }
+        if let storageError = settings.apiKeyStorageError {
+            let prefix = lang == .chinese ? "密钥存储状态：" : "API key storage status: "
+            safeDetails += "\n\n\(prefix)\(storageError)"
+        }
+        return safeDetails
+    }
+
+    private func formattedHTTPFailure(model: String, status: Int, message: String, language: UILanguage) -> String {
+        let hint: String
+        switch status {
+        case 401:
+            hint = language == .chinese
+                ? "认证失败，请检查 API 密钥、服务商和接口地址。"
+                : "Authentication failed. Check the API key, provider, and endpoint."
+        case 403:
+            hint = language == .chinese
+                ? "服务拒绝访问，请检查密钥权限和模型访问权限。"
+                : "Access was denied. Check key permissions and model access."
+        case 429:
+            hint = language == .chinese
+                ? "请求过于频繁或额度不足，请检查服务商限额。"
+                : "Rate limit or quota exceeded. Check provider limits."
+        case 500...599:
+            hint = language == .chinese
+                ? "服务商暂时出错，请稍后重试或检查备用模型。"
+                : "The provider reported a server error. Retry or check a fallback model."
+        default:
+            hint = language == .chinese ? "服务商返回 HTTP \(status)。" : "The provider returned HTTP \(status)."
+        }
+        return "\(model)：\(hint)\n\(message)"
+    }
+
+    private static func httpStatus(in message: String) -> Int? {
+        guard let range = message.range(of: #"HTTP\s+(\d{3})"#, options: .regularExpression) else { return nil }
+        return Int(message[range].suffix(3))
+    }
+
     private func acceptTranslationResult(
         _ result: String,
         sourceText: String,
